@@ -1,0 +1,64 @@
+#!/usr/bin/env raku
+
+use Async::Command::Multi;
+use Our::Grid;
+
+my %command;
+my $grid                    = Our::Grid.new;
+$grid.title('Exadata Cell Node Status');
+
+for 'ct', 'jg' -> $site {
+    loop (my $unit = 2; $unit <= 4; $unit++) {
+        my $admin-node      =  $site ~ 'x' ~ $unit ~ 'dbadm01';
+        loop (my $node = 1; $node <= 7; $node++) {
+            my $cell        = $site ~ 'x' ~ $unit ~ 'celadm' ~ $node.fmt("%02d");       # ctx2celadm07
+            %command{$cell} =   '/usr/bin/ssh', $admin-node, '/usr/bin/sudo', '/usr/bin/ssh ' ~ $cell ~ ' cellcli -e list physicaldisk';
+        }
+    }
+}
+
+my %results             = Async::Command::Multi.new(:%command).sow.reap;
+
+$grid.add-heading: 'Cell',                                                              :justification<center>, :bold;
+$grid.add-heading: 'Name',                                                              :justification<center>, :bold;
+$grid.add-heading: 'Serial',                                                            :justification<center>, :bold;
+$grid.add-heading: 'Status',                                                            :justification<center>, :bold;
+
+for %results.keys.sort -> $cell {
+    $grid.add-cell(:cell(Our::Grid::Cell.new(:text($cell),                              :justification<right>,  :foreground<white>, :highlight(15, 79, 52), :background(15, 79, 52))),  :0col);
+    for %results{$cell}.stdout-results.lines -> $record {
+        my @fields      = $record.trim.split(/\s+/);
+        $grid.add-cell(:cell(Our::Grid::Cell.new(:text(@fields[0]),                     :justification<right>,  :foreground<white>, :highlight(15, 79, 52), :background(15, 79, 52))),  :1col);
+        $grid.add-cell(:cell(Our::Grid::Cell.new(:text(@fields[1]),                     :justification<right>,  :foreground<white>, :highlight(15, 79, 52), :background(15, 79, 52))),  :2col);
+        if @fields[2] eq 'normal' {
+            $grid.add-cell(:cell(Our::Grid::Cell.new(:text(@fields[2..*].join(' ')),    :justification<right>,  :foreground<white>, :highlight(15, 79, 52), :background(15, 79, 52))),  :3col);
+        }
+        else {
+            $grid.add-cell(:cell(Our::Grid::Cell.new(:text(@fields[2..*].join(' ')),    :justification<right>,  :foreground<red>, :highlight(15, 79, 52), :background(15, 79, 52))),  :3col);
+        }
+        $grid.current-row++;
+    }
+}
+
+#$grid.CSV-print;
+$grid.ANSI-print;
+#$grid.TEXT-print;
+#$grid.HTML-print;
+
+=finish
+
+for %command.keys.sort -> $cell {
+    put $cell;                                                          # put %command{$cell};
+    my $proc                = run %command{$cell}.flat, :out, :err;
+    if $proc.exitcode {
+        note $proc.os-error if $proc.os-error;
+        my $err             = $proc.err.slurp(:close);
+        note $err           if $err;
+        die $proc.exitcode;
+    }
+    my @out                 = $proc.out.slurp(:close).lines;
+    for @out -> $record {
+        my @fields      = $record.trim.split(/\s+/);
+        put "\t" ~ @fields[0..1].join("\t") ~ "\t" ~ @fields[2..*].join(' ') if @fields[2] ne 'normal';
+    }
+}
