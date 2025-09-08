@@ -1,0 +1,159 @@
+#!/usr/bin/env raku
+
+use Async::Command::Multi;
+use Data::Dump::Tree;
+use Our::Cache;
+use JSON::Fast;
+
+class PHYSICALDISK_RECORD {
+    has Str             $.name;
+    has Str             $.serial;
+    has Str             $.status;
+}
+
+class ALERTHISTORY_RECORD {
+    has Str             $.name;
+    has DateTime        $.datetime;
+    has Str             $.precedence;
+    has Str             $.message;
+}
+
+my @EXADATA-adms;
+my %inventory;
+my %status;
+my %command;
+my $id-prefix           = 'DateTime-Last-alerthistory-Record';
+
+my @redis-servers = slurp("$*HOME/.redis-servers").chomp.split("\n");
+
+my @redis-clis;
+for @redis-servers -> $redis-server {
+    my @cmd-string = sprintf("ssh -L 127.0.0.1:6379:%s:6379 %s /usr/bin/redis-cli", $redis-server, $redis-server).split: /\s+/;
+    @redis-clis.push: @cmd-string;
+}
+
+for @redis-clis -> @redis-cli {
+    my @rcmd        = flat @redis-cli,
+                      '--raw',
+                      'KEYS',
+                      'eb:exadata:adm:*';
+    my $proc        = run   @rcmd, :out, :err;
+    my $out         = $proc.out.slurp(:close);
+    my $err         = $proc.err.slurp(:close);
+    fail 'FAILED: ' ~ @rcmd ~ ":\t" ~ $err if $err;
+    if $out {
+        my @z-keys  = $out.chomp.split("\n");
+        die "No EXADATA adm keys!" unless @z-keys;
+        @rcmd       = flat @redis-cli,
+                      '--raw',
+                      'SUNION',
+                      @z-keys;
+        $proc       = run   @rcmd, :out, :err;
+        $out        = $proc.out.slurp(:close);
+        $err        = $proc.err.slurp(:close);
+        if $err {
+            warn 'ERROR: ' ~ @rcmd.join(' ') ~ ":\t" ~ $err;
+            next;
+        }
+        next        unless $out;
+        @EXADATA-adms = $out.chomp.split("\n").sort;
+        last;
+    }
+}
+
+sub MAIN (
+    Int   :$log-days        = 0,               #= log days to display (bypass "only unseen logs" mechanism)
+) {
+    die                     unless @EXADATA-adms.elems;
+    %command                = ();
+    for @EXADATA-adms -> $adm {
+        %command{$adm}      = 'ssh', $adm, 'sudo', 'dcli', '-l', 'root', '-g', '/root/cell_group', '"cellcli -e list physicaldisk"';
+    }
+
+    my %physicaldisk        = Async::Command::Multi.new(:%command).sow.reap;
+
+    for %physicaldisk.keys.sort -> $adm {
+        for %physicaldisk{$adm}.stdout-results.lines -> $record {
+            my @fields      = $record.trim.split(/\s+/);
+            my $node        = @fields[0].ends-with(':') ?? @fields[0].chop(1) !! @fields[0];
+            %inventory{$adm}{$node} = '';
+            %status{$adm}<PHYSICALDISK>{$node}.push: PHYSICALDISK_RECORD.new:
+                :name(@fields[1]),
+                :serial(@fields[2]),
+                :status(@fields[3..*].join(' '));
+        }
+    }
+
+    my $identifier          = 'alerthistory_datetimes';
+    my %ah-dt-cache;
+    my $ah-dt-cache         = Our::Cache.new(:$identifier);
+
+    if ! $log-days && $ah-dt-cache.cache-hit {
+        %ah-dt-cache        = from-json($ah-dt-cache.fetch) or note $?LINE;
+        for %ah-dt-cache.keys.sort -> $adm {
+            for %ah-dt-cache{$adm}.keys.sort -> $node {
+                %ah-dt-cache{$adm}{$node} = DateTime.new: %ah-dt-cache{$adm}{$node};
+            }
+        }
+    }
+    else {
+        my $first-log       = now - (365 * 24 * 60 * 60);
+        $first-log          = now - ($log-days * 24 * 60 * 60) if $log-days;
+        my $first-dt        = DateTime.new(:timezone($*TZ), $first-log).truncated-to('second');
+        for %inventory.keys.sort -> $adm {
+            for %inventory{$adm}.keys.sort -> $node {
+                %ah-dt-cache{$adm}{$node} = $first-dt.clone;
+            }
+        }
+        $ah-dt-cache.store(:data(to-json(%ah-dt-cache)));
+    }
+
+    %command                = ();
+    for %inventory.keys -> $adm {
+        for %inventory{$adm}.keys.sort -> $cell {
+            %command{$cell} = (
+                                'ssh',
+                                $adm,
+                                'sudo',
+                                'ssh',
+                                $cell,
+                                Q/"cellcli -e list alerthistory WHERE begintime \\> \\'/ ~ %ah-dt-cache{$adm}{$cell}.Str ~ Q/\\'"/,
+                            );
+        }
+    }
+
+    my %alerthistory        = Async::Command::Multi.new(:%command).sow.reap;
+
+    for %inventory.keys -> $adm {
+        for %inventory{$adm}.keys.sort -> $cell {
+            for %alerthistory{$cell}.stdout-results.lines -> $record {
+                my @fields      = $record.trim.split(/\s+/);
+                my $datetime    = DateTime.new(@fields[1]);
+                %ah-dt-cache{$adm}{$cell} = $datetime if $datetime > %ah-dt-cache{$adm}{$cell};
+                %status{$adm}<ALERTHISTORY>{$cell}.push: ALERTHISTORY_RECORD.new:
+                    :name(@fields[0]),
+                    :$datetime,
+                    :precedence(@fields[2]),
+                    :message(@fields[3..*].join(' '));
+            }
+        }
+    }
+    $ah-dt-cache.store(:data(to-json(%ah-dt-cache)));
+
+    for %inventory.keys -> $adm {
+        put $adm;
+        for %inventory{$adm}.keys.sort -> $cell {
+            put "\t" ~ $cell;
+            for %status{$adm}<PHYSICALDISK>{$cell}.list -> $pd {
+                printf "\t\t%s\t%s [%s]\n", $pd.status, $pd.name, $pd.serial if $pd.status ne 'normal';
+            }
+            if (%status{$adm}<ALERTHISTORY>:exists) && (%status{$adm}<ALERTHISTORY>{$cell}:exists) {
+                for %status{$adm}<ALERTHISTORY>{$cell}.list -> $logrcd {
+                    printf "\t\t%s %s %s\n", $logrcd.datetime, $logrcd.precedence, $logrcd.message;
+                }
+            }
+        }
+    }
+}
+
+=finish
