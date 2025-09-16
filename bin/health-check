@@ -108,6 +108,9 @@ sub MAIN (
         $ah-dt-cache.store(:data(to-json(%ah-dt-cache)));
     }
 
+ddt %ah-dt-cache;
+die;
+
     %command                = ();
     for %inventory.keys -> $adm {
         for %inventory{$adm}.keys.sort -> $cell {
@@ -127,6 +130,8 @@ sub MAIN (
     for %inventory.keys -> $adm {
         for %inventory{$adm}.keys.sort -> $cell {
             for %alerthistory{$cell}.stdout-results.lines -> $record {
+put $record;
+next;
                 my @fields      = $record.trim.split(/\s+/);
                 my $datetime    = DateTime.new(@fields[1]);
                 %ah-dt-cache{$adm}{$cell} = $datetime if $datetime > %ah-dt-cache{$adm}{$cell};
@@ -138,6 +143,8 @@ sub MAIN (
             }
         }
     }
+die;
+
     $ah-dt-cache.store(:data(to-json(%ah-dt-cache)));
 
     for %inventory.keys -> $adm {
