@@ -1,8 +1,5 @@
 #!/usr/bin/env raku
 
-use Data::Dump::Tree;
-use Grammar::Debugger;
-
 my $data = q:to/END/;
     3_1    2025-08-30T03:06:44-04:00    info        Advanced Intrusion Detection Environment (AIDE) detected potential changes to software on this system. The changes are listed in /var/log/aide/aide.log and also at the end of this alert message.
                                                     Summary : :
@@ -21,37 +18,44 @@ END
 
 my grammar EXADATALOG-grammar {
     token TOP                   { <log-record>+                                                             }
-    token log-record            { <log-record-herald> \s+ <message>                                         }
-    token log-record-herald     { ^ \s+ <name-field> \s+ <datetime-field> \s+ <status-field>                }
-    token name-field            { \d+ '_' \d+                                                               }
-    token datetime-field        { \d\d\d\d '-' \d\d '-' \d\d 'T' \d\d ':' \d\d ':' \d\d '-' \d\d ':' \d\d   }
-    token status-field          { \w+                                                                       }
-    token not-log-record-herald { <!log-record-herald>                                                      }
-    token message               { <not-log-record-herald>+                                                  }
+    token log-record            { <log-record-start> || <log-record-continue>                               }
+    token log-record-start      { ^^ <log-record-herald> \s+ <log-text>                                     }
+    token log-record-herald     { \s* <name> \s+ <datetime> \s+ <status>                                    }
+    token log-record-continue   { ^^ <!before <log-record-herald>> <log-text>                               }
+    token name                  { \d+ '_' \d+                                                               }
+    token datetime              { \d\d\d\d '-' \d\d '-' \d\d 'T' \d\d ':' \d\d ':' \d\d '-' \d\d ':' \d\d   }
+    token status                { \w+                                                                       }
+    token log-text              { .+? \n                                                                    }
 }
 
-ddt EXADATALOG-grammar.parse($data);
+class EXADATALOG-record {
+    has Str         $.name      is required;
+    has DateTime    $.datetime  is required;
+    has Str         $.status    is required;
+    has Str         @.message;
+}
 
-=finish
-
-EXADATALOG-grammar.parse($data, :actions(EXADATALOG-actions.new));
+my @EXADATALOG-records;
 
 class EXADATALOG-actions {
-    has $.hmc is required;
+    method log-record-herald ($/) {
+        @EXADATALOG-records.push:   EXADATALOG-record.new(
+            :name(~$/<name>),
+            :datetime(DateTime.new(~$/<datetime>)),
+            :status(~$/<status>),
+        );
+    }
 
-    method dlpar-record ($/) {
-        my Int $partition-number    = +$/<partition-field><partition-number>;
-        %HMC{$!hmc}<LSPPARTITIONDLPAR>{$partition-number} = LSPPARTITIONDLPAR.new:
-            :$partition-number,
-            :model(~$/<partition-field><model-type><model>),
-            :type(~$/<partition-field><model-type><type>),
-            :serial-number(~$/<partition-field><serial-number>),
-            :ip-address(~$/<partition-field><ip-address>),
-            :active(?$/<active-field><active>),
-            :os-name(~$/<os-field><os-name>),
-            :os-vr(~$/<os-field><os-vr>),
-            :os-level(~$/<os-field><os-level>),
-        ;
-
+    method log-text ($/) {
+        @EXADATALOG-records[* - 1].message.push: ~$/.chomp;
     }
 }
+
+EXADATALOG-grammar.parse($data, :actions(EXADATALOG-actions));
+
+for @EXADATALOG-records -> $record {
+    printf "%-6s%-28s%-10s\n", $record.name, $record.datetime, $record.status;
+    printf "\t%s\n", $record.message.join("\n");
+}
+
+=finish
